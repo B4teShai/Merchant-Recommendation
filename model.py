@@ -11,6 +11,9 @@ import os
 import pickle
 from random import randint
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -394,6 +397,72 @@ class Recommender:
         reses = self.test_epoch()
         log(self.make_print("Test", args.epoch, reses, True))
         log(self.make_print("max", maxepoch, maxres, True))
+        # Metrics result summary
+        log("--- Metrics result ---")
+        log("Best epoch: %d | Test HR = %.4f, Test NDCG = %.4f" % (maxepoch, maxres.get("HR", 0), maxres.get("NDCG", 0)))
+        if self.metrics["TestHR"]:
+            log("Test HR  (all): %s" % (", ".join("%.4f" % v for v in self.metrics["TestHR"])))
+        if self.metrics["TestNDCG"]:
+            log("Test NDCG (all): %s" % (", ".join("%.4f" % v for v in self.metrics["TestNDCG"])))
+        log("----------------------")
+        self._save_metrics_plots()
+
+    def _save_metrics_plots(self) -> None:
+        """Plot Train/Test Loss, HR, NDCG and save to Results/."""
+        os.makedirs("Results", exist_ok=True)
+        base = "Results/" + args.save_path
+
+        n_train = len(self.metrics["TrainLoss"])
+        if n_train == 0:
+            return
+        # Train metrics saved when test runs (every tstEpoch); test has same + final run
+        steps_train = list(range(n_train))
+        n_test = len(self.metrics["TestHR"])
+        steps_test = list(range(n_test))
+
+        # 1) Loss plot
+        fig, ax = plt.subplots(figsize=(8, 5))
+        if self.metrics["TrainLoss"]:
+            ax.plot(steps_train, self.metrics["TrainLoss"], "b-", label="Train Loss", alpha=0.8)
+        if self.metrics["TrainpreLoss"]:
+            ax.plot(steps_train, self.metrics["TrainpreLoss"], "b--", label="Train preLoss", alpha=0.7)
+        if self.metrics["TestLoss"] and steps_test:
+            ax.plot(steps_test, self.metrics["TestLoss"], "r-", label="Test Loss", alpha=0.8)
+        if self.metrics["TestpreLoss"] and steps_test:
+            ax.plot(steps_test, self.metrics["TestpreLoss"], "r--", label="Test preLoss", alpha=0.7)
+        ax.set_xlabel("Eval step")
+        ax.set_ylabel("Loss")
+        ax.set_title("Training and test loss")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(base + "_loss.png", dpi=150)
+        plt.close(fig)
+        log("Saved: %s_loss.png" % base)
+
+        # 2) HR and NDCG plot
+        fig2, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+        if self.metrics["TrainHR"]:
+            ax1.plot(steps_train, self.metrics["TrainHR"], "b-", label="Train HR", alpha=0.8)
+        if self.metrics["TestHR"] and steps_test:
+            ax1.plot(steps_test, self.metrics["TestHR"], "r-", label="Test HR", alpha=0.8)
+        ax1.set_ylabel("HR")
+        ax1.set_title("Hit Rate (HR)")
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        if self.metrics["TrainNDCG"]:
+            ax2.plot(steps_train, self.metrics["TrainNDCG"], "b-", label="Train NDCG", alpha=0.8)
+        if self.metrics["TestNDCG"] and steps_test:
+            ax2.plot(steps_test, self.metrics["TestNDCG"], "r-", label="Test NDCG", alpha=0.8)
+        ax2.set_xlabel("Eval step")
+        ax2.set_ylabel("NDCG")
+        ax2.set_title("NDCG")
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(base + "_hr_ndcg.png", dpi=150)
+        plt.close(fig2)
+        log("Saved: %s_hr_ndcg.png" % base)
 
     def sample_train_batch(
         self, bat_ids, label_mat, time_mat, train_sample_num
