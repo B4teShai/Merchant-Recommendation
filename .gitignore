@@ -30,7 +30,6 @@ env/
 Models/
 History/
 *.his
-Datasets/
 
 # IDE / editor
 .idea/
