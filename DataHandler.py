@@ -48,15 +48,21 @@ def transToLsts(mat, mask=False, norm=False):
 	shape = [mat.shape[0], mat.shape[1]]
 	coomat = sp.coo_matrix(mat)
 	indices = np.array(list(map(list, zip(coomat.row, coomat.col))), dtype=np.int32)
-	data = coomat.data.astype(np.int32)
+	data = coomat.data.astype(np.float32) if norm else coomat.data.astype(np.int32)
 
 	if norm:
-		rowD = np.squeeze(np.array(1 / (np.sqrt(np.sum(mat, axis=1) + 1e-8) + 1e-8)))
-		colD = np.squeeze(np.array(1 / (np.sqrt(np.sum(mat, axis=0) + 1e-8) + 1e-8)))
+		rowSum = np.squeeze(np.asarray(np.sum(mat, axis=1)))
+		colSum = np.squeeze(np.asarray(np.sum(mat, axis=0)))
+		rowSum = np.maximum(rowSum, 0.0) + 1e-8
+		colSum = np.maximum(colSum, 0.0) + 1e-8
+		rowD = 1.0 / (np.sqrt(rowSum) + 1e-8)
+		colD = 1.0 / (np.sqrt(colSum) + 1e-8)
+		rowD = np.nan_to_num(rowD, nan=0.0, posinf=0.0, neginf=0.0)
+		colD = np.nan_to_num(colD, nan=0.0, posinf=0.0, neginf=0.0)
 		for i in range(len(data)):
 			row = indices[i, 0]
 			col = indices[i, 1]
-			data[i] = data[i] * rowD[row] * colD[col]
+			data[i] = float(coomat.data[i]) * rowD[row] * colD[col]
 
 	# half mask
 	if mask:
@@ -65,13 +71,13 @@ def transToLsts(mat, mask=False, norm=False):
 
 	if indices.shape[0] == 0:
 		indices = np.array([[0, 0]], dtype=np.int32)
-		data = np.array([0.0], np.int32)
+		data = np.array([0.0], dtype=np.float32 if norm else np.int32)
 	return indices, data, shape
 
 class DataHandler:
 	def __init__(self):
 		if args.data == 'yelp':
-			predir = './Datasets/Yelp/'
+			predir = './Datasets/yelp/'
 		elif args.data == 'gowalla':
 			predir = './Datasets/gowalla/'
 		elif args.data == 'amazon':

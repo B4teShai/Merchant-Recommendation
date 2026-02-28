@@ -22,6 +22,7 @@ from Params import args
 from DataHandler import negSamp, transpose, transToLsts
 from Utils.NNLayers import FC, get_activation, regularize
 from Utils.attention import AdditiveAttention, MultiHeadSelfAttention
+import Utils.TimeLogger as time_logger
 from Utils.TimeLogger import log
 
 
@@ -30,11 +31,13 @@ def _segment_sum_pad(
     tgt_nodes: torch.Tensor,
     pad_size: int,
     device: torch.device,
+    min_rows: int = 0,
 ) -> torch.Tensor:
-    """Aggregate src_embeds by tgt_nodes (segment_sum), then pad rows. Output [max_idx+1+pad_size, dim]."""
+    """Aggregate src_embeds by tgt_nodes (segment_sum), then pad rows.
+    Output has at least min_rows rows so that lat[0..min_rows-1] is valid."""
     E, dim = src_embeds.shape
     max_tgt = tgt_nodes.max().item()
-    out_size = max_tgt + 1 + pad_size
+    out_size = max(max_tgt + 1, min_rows) + pad_size
     out = torch.zeros(out_size, dim, dtype=src_embeds.dtype, device=device)
     tgt_exp = tgt_nodes.unsqueeze(1).expand(-1, dim)
     out.scatter_add_(0, tgt_exp, src_embeds)
@@ -157,7 +160,13 @@ class RecommenderNet(nn.Module):
             )
         tgt_nodes = adj_idx[:, 0]
         src_nodes = adj_idx[:, 1]
-        src_embeds = srclats[src_nodes]
+        # Clamp to embedding size so gather never gets index out of bounds (e.g. 1-based data)
+        n_src = int(srclats.shape[0])
+        n_tgt = int(args.user if node_type == "user" else args.item)
+        src_nodes = src_nodes.clamp(0, n_src - 1).long()
+        tgt_nodes = tgt_nodes.clamp(0, n_tgt - 1).long()
+        # Use index_select to avoid any advanced-indexing OOB path
+        src_embeds = srclats.index_select(0, src_nodes)
         # Edge dropout: mask out some edges (scale by 1/keep_rate to keep expectation)
         if keep_rate < 1.0 and self.training:
             mask = (torch.rand(E, device=srclats.device) < keep_rate).to(srclats.dtype) / (
@@ -166,7 +175,7 @@ class RecommenderNet(nn.Module):
             src_embeds = src_embeds * mask.unsqueeze(1)
         pad_size = 100
         lat = _segment_sum_pad(
-            src_embeds, tgt_nodes, pad_size, self.device
+            src_embeds, tgt_nodes, pad_size, self.device, min_rows=n_tgt
         )
         if node_type == "user":
             users = torch.arange(args.user, device=self.device, dtype=torch.long)
@@ -308,7 +317,18 @@ class Recommender:
             "TestHR": [],
             "TestNDCG": [],
         }
+        for k in args.topk:
+            self.metrics["TrainHR@%d" % k] = []
+            self.metrics["TrainNDCG@%d" % k] = []
+            self.metrics["TestHR@%d" % k] = []
+            self.metrics["TestNDCG@%d" % k] = []
         print("USER", args.user, "ITEM", args.item)
+
+    def _results_base_dir(self) -> str:
+        """Return results/<dataset_name>/ and ensure it exists."""
+        base = os.path.join("results", args.data)
+        os.makedirs(base, exist_ok=True)
+        return base
 
     def make_print(self, name: str, ep: int, reses: dict, save: bool) -> str:
         ret = "Epoch %d/%d, %s: " % (ep, args.epoch, name)
@@ -327,11 +347,16 @@ class Recommender:
         for i in range(args.graphNum):
             seqadj = self.handler.subMat[i]
             idx, data, shape = transToLsts(seqadj, norm=True)
+            # Force indices in-bounds (guard against 1-based or corrupted data)
+            nrow, ncol = shape[0], shape[1]
+            idx = np.clip(idx, [0, 0], [nrow - 1, ncol - 1]).astype(np.int64)
             idx_t = torch.from_numpy(idx).long().to(self.device)
             val_t = torch.from_numpy(data.astype(np.float32)).to(self.device)
             sub_adj.append((idx_t, val_t, shape))
             seqadj_tp = transpose(seqadj)
             idx2, data2, shape2 = transToLsts(seqadj_tp, norm=True)
+            nrow2, ncol2 = shape2[0], shape2[1]
+            idx2 = np.clip(idx2, [0, 0], [nrow2 - 1, ncol2 - 1]).astype(np.int64)
             idx_t2 = torch.from_numpy(idx2).long().to(self.device)
             val_t2 = torch.from_numpy(data2.astype(np.float32)).to(self.device)
             sub_tp_adj.append((idx_t2, val_t2, shape2))
@@ -385,12 +410,10 @@ class Recommender:
             if test:
                 reses = self.test_epoch()
                 log(self.make_print("Test", ep, reses, test))
-            if (
-                ep % args.tstEpoch == 0
-                and reses.get("NDCG", 0) > maxndcg
-            ):
+            primary_ndcg = reses.get("NDCG@%d" % args.topk[0], reses.get("NDCG", 0))
+            if ep % args.tstEpoch == 0 and primary_ndcg > maxndcg:
                 self.save_history()
-                maxndcg = reses["NDCG"]
+                maxndcg = primary_ndcg
                 maxres = reses
                 maxepoch = ep
             print()
@@ -399,23 +422,65 @@ class Recommender:
         log(self.make_print("max", maxepoch, maxres, True))
         # Metrics result summary
         log("--- Metrics result ---")
-        log("Best epoch: %d | Test HR = %.4f, Test NDCG = %.4f" % (maxepoch, maxres.get("HR", 0), maxres.get("NDCG", 0)))
+        for k in args.topk:
+            log(
+                "Best epoch: %d | Test HR@%d = %.4f, Test NDCG@%d = %.4f"
+                % (maxepoch, k, maxres.get("HR@%d" % k, 0), k, maxres.get("NDCG@%d" % k, 0))
+            )
         if self.metrics["TestHR"]:
             log("Test HR  (all): %s" % (", ".join("%.4f" % v for v in self.metrics["TestHR"])))
         if self.metrics["TestNDCG"]:
             log("Test NDCG (all): %s" % (", ".join("%.4f" % v for v in self.metrics["TestNDCG"])))
+        for k in args.topk:
+            key_hr, key_ndcg = "TestHR@%d" % k, "TestNDCG@%d" % k
+            if self.metrics.get(key_hr):
+                log("Test HR@%d  (all): %s" % (k, ", ".join("%.4f" % v for v in self.metrics[key_hr])))
+            if self.metrics.get(key_ndcg):
+                log("Test NDCG@%d (all): %s" % (k, ", ".join("%.4f" % v for v in self.metrics[key_ndcg])))
         log("----------------------")
+        self._save_metrics_file(maxepoch, maxres)
         self._save_metrics_plots()
 
+    def _save_metrics_file(self, maxepoch: int, maxres: dict) -> None:
+        """Write metrics summary to results/<data>/<save_path>_metrics.txt."""
+        base_dir = self._results_base_dir()
+        path = os.path.join(base_dir, args.save_path + "_metrics.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("dataset: %s\n" % args.data)
+            f.write("save_path: %s\n" % args.save_path)
+            f.write("topk: %s\n" % args.topk)
+            f.write("--- Metrics result ---\n")
+            for k in args.topk:
+                f.write(
+                    "Best epoch: %d | Test HR@%d = %.4f, Test NDCG@%d = %.4f\n"
+                    % (maxepoch, k, maxres.get("HR@%d" % k, 0), k, maxres.get("NDCG@%d" % k, 0))
+                )
+            for k in args.topk:
+                key_hr, key_ndcg = "TestHR@%d" % k, "TestNDCG@%d" % k
+                if self.metrics.get(key_hr):
+                    f.write(
+                        "Test HR@%d  (all): %s\n"
+                        % (k, ", ".join("%.4f" % v for v in self.metrics[key_hr]))
+                    )
+                if self.metrics.get(key_ndcg):
+                    f.write(
+                        "Test NDCG@%d (all): %s\n"
+                        % (k, ", ".join("%.4f" % v for v in self.metrics[key_ndcg]))
+                    )
+            if self.metrics.get("TrainLoss"):
+                f.write("Train Loss (all): %s\n" % ", ".join("%.4f" % v for v in self.metrics["TrainLoss"]))
+            if self.metrics.get("TestLoss"):
+                f.write("Test Loss (all): %s\n" % ", ".join("%.4f" % v for v in self.metrics["TestLoss"]))
+        log("Saved: %s" % path)
+
     def _save_metrics_plots(self) -> None:
-        """Plot Train/Test Loss, HR, NDCG and save to Results/."""
-        os.makedirs("Results", exist_ok=True)
-        base = "Results/" + args.save_path
+        """Plot Train/Test Loss, HR, NDCG and save to results/<data>/."""
+        base_dir = self._results_base_dir()
+        base = os.path.join(base_dir, args.save_path)
 
         n_train = len(self.metrics["TrainLoss"])
         if n_train == 0:
             return
-        # Train metrics saved when test runs (every tstEpoch); test has same + final run
         steps_train = list(range(n_train))
         n_test = len(self.metrics["TestHR"])
         steps_test = list(range(n_test))
@@ -440,20 +505,35 @@ class Recommender:
         plt.close(fig)
         log("Saved: %s_loss.png" % base)
 
-        # 2) HR and NDCG plot
+        # 2) HR and NDCG plot (all K)
         fig2, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
+        colors = plt.cm.tab10(np.linspace(0, 1, max(len(args.topk) * 2, 2)))
+        for idx, k in enumerate(args.topk):
+            key_hr, key_ndcg = "TestHR@%d" % k, "TestNDCG@%d" % k
+            if self.metrics.get(key_hr) and steps_test:
+                ax1.plot(
+                    steps_test,
+                    self.metrics[key_hr],
+                    color=colors[idx % len(colors)],
+                    label="Test HR@%d" % k,
+                    alpha=0.8,
+                )
+            if self.metrics.get(key_ndcg) and steps_test:
+                ax2.plot(
+                    steps_test,
+                    self.metrics[key_ndcg],
+                    color=colors[idx % len(colors)],
+                    label="Test NDCG@%d" % k,
+                    alpha=0.8,
+                )
         if self.metrics["TrainHR"]:
             ax1.plot(steps_train, self.metrics["TrainHR"], "b-", label="Train HR", alpha=0.8)
-        if self.metrics["TestHR"] and steps_test:
-            ax1.plot(steps_test, self.metrics["TestHR"], "r-", label="Test HR", alpha=0.8)
+        if self.metrics["TrainNDCG"]:
+            ax2.plot(steps_train, self.metrics["TrainNDCG"], "b-", label="Train NDCG", alpha=0.8)
         ax1.set_ylabel("HR")
         ax1.set_title("Hit Rate (HR)")
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-        if self.metrics["TrainNDCG"]:
-            ax2.plot(steps_train, self.metrics["TrainNDCG"], "b-", label="Train NDCG", alpha=0.8)
-        if self.metrics["TestNDCG"] and steps_test:
-            ax2.plot(steps_test, self.metrics["TestNDCG"], "r-", label="Test NDCG", alpha=0.8)
         ax2.set_xlabel("Eval step")
         ax2.set_ylabel("NDCG")
         ax2.set_title("NDCG")
@@ -463,6 +543,10 @@ class Recommender:
         fig2.savefig(base + "_hr_ndcg.png", dpi=150)
         plt.close(fig2)
         log("Saved: %s_hr_ndcg.png" % base)
+
+        # Write full run log to file
+        log_path = os.path.join(base_dir, args.save_path + "_run.log")
+        time_logger.flush_log(log_path)
 
     def sample_train_batch(
         self, bat_ids, label_mat, time_mat, train_sample_num
@@ -691,8 +775,8 @@ class Recommender:
         )
 
     def test_epoch(self) -> dict:
-        epoch_hit = 0
-        epoch_ndcg = 0
+        epoch_hits = {k: 0 for k in args.topk}
+        epoch_ndcgs = {k: 0.0 for k in args.topk}
         ids = self.handler.tstUsrs
         num = len(ids)
         tst_bat = args.batch
@@ -749,40 +833,52 @@ class Recommender:
                 if args.uid != -1:
                     print(preds[args.uid])
                 if args.test:
-                    hit, ndcg = self.calc_res(
+                    res_batch = self.calc_res(
                         np.reshape(preds, [ed - st, args.testSize]),
                         tem_tst,
                         tst_locs,
                     )
                 else:
-                    hit, ndcg = self.calc_res(
+                    res_batch = self.calc_res(
                         np.reshape(preds, [ed - st, args.testSize]),
                         val_list,
                         tst_locs,
                     )
-                epoch_hit += hit
-                epoch_ndcg += ndcg
+                for k in args.topk:
+                    epoch_hits[k] += res_batch[k][0]
+                    epoch_ndcgs[k] += res_batch[k][1]
+                # log line uses primary K
+                pk = args.topk[0]
                 log(
-                    "Steps %d/%d: hit10 = %d, ndcg10 = %d" % (i, steps, hit, ndcg),
+                    "Steps %d/%d: hit%d = %d, ndcg%d = %d"
+                    % (i, steps, pk, res_batch[pk][0], pk, res_batch[pk][1]),
                     save=False,
                     oneline=True,
                 )
-        return {
-            "HR": epoch_hit / num,
-            "NDCG": epoch_ndcg / num,
+        primary_k = args.topk[0]
+        reses = {
+            "HR": epoch_hits[primary_k] / num,
+            "NDCG": epoch_ndcgs[primary_k] / num,
         }
+        for k in args.topk:
+            reses["HR@%d" % k] = epoch_hits[k] / num
+            reses["NDCG@%d" % k] = epoch_ndcgs[k] / num
+        return reses
 
     def calc_res(self, preds, tem_tst, tst_locs):
-        hit = 0
-        ndcg = 0
+        """For each K in args.topk, compute (hit_count, ndcg_sum) for this batch."""
+        max_k = max(args.topk)
+        out = {k: [0, 0.0] for k in args.topk}  # hit count, ndcg sum
         for j in range(preds.shape[0]):
             predvals = list(zip(preds[j], tst_locs[j]))
             predvals.sort(key=lambda x: x[0], reverse=True)
-            shoot = list(map(lambda x: x[1], predvals[: args.shoot]))
-            if tem_tst[j] in shoot:
-                hit += 1
-                ndcg += np.reciprocal(np.log2(shoot.index(tem_tst[j]) + 2))
-        return hit, ndcg
+            top_items = list(map(lambda x: x[1], predvals[:max_k]))
+            for k in args.topk:
+                shoot = top_items[:k]
+                if tem_tst[j] in shoot:
+                    out[k][0] += 1
+                    out[k][1] += np.reciprocal(np.log2(shoot.index(tem_tst[j]) + 2))
+        return {k: (out[k][0], out[k][1]) for k in args.topk}
 
     def save_history(self) -> None:
         if args.epoch == 0:
@@ -802,4 +898,11 @@ class Recommender:
         if os.path.isfile(his_path):
             with open(his_path, "rb") as fs:
                 self.metrics = pickle.load(fs)
+            # Ensure per-K keys exist (e.g. when loading history from older runs)
+            for k in args.topk:
+                for prefix in ("Train", "Test"):
+                    for m in ("HR", "NDCG"):
+                        key = "%s%s@%d" % (prefix, m, k)
+                        if key not in self.metrics:
+                            self.metrics[key] = []
         log("Model Loaded")

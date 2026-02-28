@@ -38,7 +38,13 @@ def parse_args():
     parser.add_argument("--gnn_layer", default=2, type=int, help="number of gnn layers")
     parser.add_argument("--trnNum", default=10000, type=int, help="number of training instances per epoch")
     parser.add_argument("--load_model", default=None, help="model name to load")
-    parser.add_argument("--shoot", default=10, type=int, help="K of top k")
+    parser.add_argument("--shoot", default=10, type=int, help="K of top k (legacy, use --topk for multi-K)")
+    parser.add_argument(
+        "--topk",
+        default="5,10,20",
+        type=str,
+        help="comma-separated K values for HR@K and NDCG@K (e.g. 5,10,20)",
+    )
     parser.add_argument("--data", default="yelp", type=str, help="name of dataset")
     parser.add_argument("--target", default="buy", type=str, help="target behavior to predict on")
     parser.add_argument(
@@ -73,7 +79,17 @@ def parse_args():
     parser.add_argument("--test", default=True, type=bool, help="test or val")
     parser.add_argument("--ssl", default=True, type=bool, help="use self-supervised learning")
     parser.add_argument("--uid", default=0, type=int, help="show user score")
-    return parser.parse_args()
+    parser.add_argument(
+        "--device",
+        default=None,
+        type=str,
+        help="device: 'cuda', 'cuda:0', 'cpu', or None for auto (prefer cuda if available)",
+    )
+    a = parser.parse_args()
+    a.topk = [int(k.strip()) for k in a.topk.split(",") if k.strip()]
+    if not a.topk:
+        a.topk = [10]
+    return a
 
 
 args = parse_args()

@@ -18,6 +18,17 @@ def log(msg, save=None, oneline=False):
 	else:
 		print(tem)
 
+def flush_log(path, clear=True):
+	"""Write accumulated logmsg to file and optionally clear it."""
+	global logmsg
+	try:
+		with open(path, 'w', encoding='utf-8') as f:
+			f.write(logmsg)
+		if clear:
+			logmsg = ''
+	except Exception as e:
+		print('LOGGER: failed to write %s: %s' % (path, e))
+
 def marktime(marker):
 	global timemark
 	timemark[marker] = datetime.datetime.now()
