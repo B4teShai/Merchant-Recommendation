@@ -14,13 +14,13 @@ def parse_args():
     parser.add_argument("--graphNum", default=8, type=int, help="number of graphs based on time series")
     parser.add_argument("--decay", default=0.96, type=float, help="LR decay factor (paper: 0.96 epoch decay)")
     parser.add_argument("--decay_step", default=1, type=int, help="LR decay every N epochs (paper: 1)")
-    parser.add_argument("--save_path", default="tem", help="file name to save model and training record")
+    parser.add_argument("--save_path", default=None, help="save name (default: same as --data, e.g. amazon)")
     parser.add_argument("--latdim", default=64, type=int, help="embedding size")
     parser.add_argument("--ssldim", default=32, type=int, help="user weight embedding size")
     parser.add_argument("--rank", default=4, type=int, help="embedding size")
     parser.add_argument("--memosize", default=2, type=int, help="memory size")
     parser.add_argument("--sampNum", default=40, type=int, help="batch size for sampling")
-    parser.add_argument("--testSize", default=100, type=int, help="size for test")
+    parser.add_argument("--testSize", default=1000, type=int, help="test candidates per user (1 pos + testSize-1 neg; paper: 1000)")
     parser.add_argument("--sslNum", default=20, type=int, help="batch size for ssl")
     parser.add_argument(
         "--query_vector_dim",
@@ -45,7 +45,7 @@ def parse_args():
         type=str,
         help="comma-separated K values for HR@K and NDCG@K (e.g. 5,10,20)",
     )
-    parser.add_argument("--data", default="yelp", type=str, help="name of dataset")
+    parser.add_argument("--data", default="amazon", type=str, help="name of dataset (amazon, gowalla, movielens, yelp)")
     parser.add_argument("--target", default="buy", type=str, help="target behavior to predict on")
     parser.add_argument(
         "--deep_layer",
@@ -89,7 +89,11 @@ def parse_args():
     a.topk = [int(k.strip()) for k in a.topk.split(",") if k.strip()]
     if not a.topk:
         a.topk = [10]
+    # Default save_path to dataset name so model/history/results go under same name
+    if a.save_path is None or a.save_path.strip() == "":
+        a.save_path = a.data
     return a
 
 
 args = parse_args()
+

@@ -325,8 +325,8 @@ class Recommender:
         print("USER", args.user, "ITEM", args.item)
 
     def _results_base_dir(self) -> str:
-        """Return results/<dataset_name>/ and ensure it exists."""
-        base = os.path.join("results", args.data)
+        """Return Results/<dataset_name>/ and ensure it exists (model, history, metrics, plots)."""
+        base = os.path.join("Results", args.data)
         os.makedirs(base, exist_ok=True)
         return base
 
@@ -727,19 +727,29 @@ class Recommender:
         mask = [None] * args.batch
         val_list = [None] * args.batch
         cur = 0
+        n_neg = args.testSize - 1
         for i in range(batch):
             if args.test:
                 posloc = tem_tst[i]
             else:
                 posloc = self.handler.sequence[bat_ids[i]][-1]
                 val_list[i] = posloc
+            # Paper: 999 negatives + 1 positive = 1000 candidates per user
             rdn_neg_set = np.array(
-                self.handler.test_dict.get(bat_ids[i] + 1, [])[: args.testSize - 1]
+                self.handler.test_dict.get(bat_ids[i] + 1, [])[:n_neg], dtype=np.int64
             )
             if len(rdn_neg_set) > 0:
                 rdn_neg_set = rdn_neg_set - 1
-            else:
-                rdn_neg_set = np.random.randint(0, args.item, size=args.testSize - 1)
+            if len(rdn_neg_set) < n_neg:
+                # Fill with random negatives (exclude user's interacted items; paper: 999 negs)
+                neg_pool = np.where(tem_label[i] == 0)[0]
+                neg_pool = neg_pool[neg_pool != posloc]
+                n_need = n_neg - len(rdn_neg_set)
+                if len(neg_pool) >= n_need:
+                    extra = np.random.choice(neg_pool, size=n_need, replace=False)
+                else:
+                    extra = np.random.choice(neg_pool, size=n_need, replace=True) if len(neg_pool) > 0 else np.random.randint(0, args.item, size=n_need)
+                rdn_neg_set = np.concatenate([rdn_neg_set.astype(np.int64), np.asarray(extra, dtype=np.int64)])[:n_neg]
             locset = np.concatenate((rdn_neg_set, np.array([posloc])))
             tst_locs[i] = locset
             for j in range(len(locset)):
@@ -749,8 +759,9 @@ class Recommender:
                 cur += 1
             sequence[i] = np.zeros(args.pos_length, dtype=np.int64)
             mask[i] = np.zeros(args.pos_length, dtype=np.float32)
+            # At test: use history only (exclude last item) to avoid leakage
             if args.test:
-                posset = self.handler.sequence[bat_ids[i]]
+                posset = self.handler.sequence[bat_ids[i]][:-1]
             else:
                 posset = self.handler.sequence[bat_ids[i]][:-1]
             if len(posset) <= args.pos_length:
@@ -883,18 +894,18 @@ class Recommender:
     def save_history(self) -> None:
         if args.epoch == 0:
             return
-        os.makedirs("History", exist_ok=True)
-        with open("History/" + args.save_path + ".his", "wb") as fs:
+        base = self._results_base_dir()
+        with open(os.path.join(base, "history.his"), "wb") as fs:
             pickle.dump(self.metrics, fs)
-        os.makedirs("Models", exist_ok=True)
-        torch.save(self.model.state_dict(), "Models/" + args.save_path)
-        log("Model Saved: %s" % args.save_path)
+        torch.save(self.model.state_dict(), os.path.join(base, "model.pt"))
+        log("Model Saved: %s" % os.path.join(base, "model.pt"))
 
     def load_model(self) -> None:
+        base = os.path.join("Results", args.load_model)
         self.model.load_state_dict(
-            torch.load("Models/" + args.load_model, map_location=self.device)
+            torch.load(os.path.join(base, "model.pt"), map_location=self.device)
         )
-        his_path = "History/" + args.load_model + ".his"
+        his_path = os.path.join(base, "history.his")
         if os.path.isfile(his_path):
             with open(his_path, "rb") as fs:
                 self.metrics = pickle.load(fs)
